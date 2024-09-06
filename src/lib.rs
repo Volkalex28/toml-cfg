@@ -24,18 +24,18 @@
 //!
 //! ```rust
 //! // lib-one
-//! #[toml_cfg::toml_config]
+//! #[derive(toml_cfg::TomlConfig)]
 //! pub struct Config {
-//!     #[default(32)]
+//!     #[toml_cfg(default(32))]
 //!     buffer_size: usize,
 //! }
 //! ```
 //!
 //!```rust
 //! // lib-two
-//! #[toml_cfg::toml_config]
+//! #[derive(toml_cfg::TomlConfig)]
 //! pub struct Config {
-//!     #[default("hello")]
+//!     #[toml_cfg(default("hello"))]
 //!     greeting: &'static str,
 //! }
 //!
@@ -88,160 +88,325 @@
 //! ```
 //!
 
-use heck::ToShoutySnekCase;
+use heck::{ToShoutySnekCase, ToSnekCase};
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro_warning::Warning;
 use quote::{quote, ToTokens};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use syn::parse;
+use syn::spanned::Spanned;
+use syn::token::Token;
 use syn::Expr;
 
-#[derive(Deserialize, Clone, Debug)]
+type Crates = HashMap<String, toml::Table>;
+type Parsed = Vec<(Vec<syn::Ident>, syn::Expr)>;
+
+struct FieldConfig {
+    default: (Expr, bool), // true if deprecated
+}
+
+impl parse::Parse for FieldConfig {
+    fn parse(input: parse::ParseStream) -> syn::Result<Self> {
+        let mut default = None;
+        let mut deprecated = Vec::new();
+
+        while !input.is_empty() {
+            let lookahead = input.lookahead1();
+
+            if parse_paren(&mut default, &lookahead, input, tokens::default)? {
+            } else if input.peek(tokens::deprecated) {
+                input.parse::<tokens::deprecated>()?;
+
+                let content;
+                syn::parenthesized!(content in input);
+
+                if content.parse::<tokens::default>().is_ok() {
+                    deprecated.push(tokens::default::display());
+                }
+
+                if content.peek(syn::Token![,]) {
+                    content.parse::<syn::Token![,]>()?;
+                }
+            } else {
+                return Err(lookahead.error());
+            }
+        }
+
+        let default = {
+            let is_deprecated = deprecated.contains(&tokens::default::display());
+            let Some(value) = default else {
+                let message = format!("Attribute {} is not present", tokens::default::display());
+                return Err(syn::Error::new(Span::call_site(), message));
+            };
+            (value, is_deprecated)
+        };
+
+        Ok(Self { default })
+    }
+}
+
+struct Rettrigerring(PathBuf);
+impl ToTokens for Rettrigerring {
+    fn to_tokens(&self, tokens: &mut TokenStream2) {
+        let cfg_path = format!("{}", self.0.display());
+        tokens.extend(quote! {
+            const _: &[u8] = include_bytes!(#cfg_path);
+        })
+    }
+}
+
 struct Config {
-    #[serde(flatten)]
-    crates: HashMap<String, Defn>,
+    input: syn::ItemStruct,
+    fields_config: Vec<FieldConfig>,
+    retrigger: Option<Rettrigerring>,
+    config: Parsed,
+    is_attribute: bool,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
-struct Defn {
-    #[serde(flatten)]
-    vals: HashMap<String, toml::Value>,
-}
+impl Config {
+    const FILE_NAME: &'static str = "cfg.toml";
+    const ENV_KEY: &'static str = "TOML_CFG";
+    const ENV_VALUE: &'static str = "require_cfg_present";
 
-#[proc_macro_attribute]
-pub fn toml_config(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let struct_defn =
-        syn::parse::<syn::ItemStruct>(item).expect("Failed to parse configuration structure!");
+    fn new(input: TokenStream, is_attribute: bool) -> syn::Result<Self> {
+        let mut input = syn::parse::<syn::ItemStruct>(input).map_err(|esyn| {
+            const MESSAGE: &'static str = "Failed to parse configuration structure!";
 
-    let require_cfg_present = if let Ok(val) = env::var("TOML_CFG") {
-        val.contains("require_cfg_present")
-    } else {
-        false
-    };
+            let mut error = syn::Error::new(esyn.span(), MESSAGE);
+            error.combine(esyn);
 
-    let root_path = find_root_path();
-    let cfg_path = root_path.clone();
-    let cfg_path = cfg_path.as_ref().and_then(|c| {
-        let mut x = c.to_owned();
-        x.push("cfg.toml");
-        Some(x)
-    });
+            error
+        })?;
 
-    let maybe_cfg = cfg_path.as_ref().and_then(|c| load_crate_cfg(&c));
-    let got_cfg = maybe_cfg.is_some();
-    if require_cfg_present {
-        assert!(
-            got_cfg,
-            "TOML_CFG=require_cfg_present set, but valid config not found!"
-        )
+        let fields_config = Self::fields_config(&mut input)?;
+
+        let path = Self::get_path();
+        let config = path.as_ref().and_then(|path| Self::load(input.span(), path)).transpose()?;
+
+        let retrigger = path.filter(|_| config.is_some()).map(Rettrigerring);
+        let config = Self::apply_config(&input, config.unwrap_or_default())?;
+
+        Ok(Self { input, fields_config, retrigger, config, is_attribute })
     }
-    let cfg = maybe_cfg.unwrap_or_else(|| Defn::default());
 
-    let mut struct_defn_fields = TokenStream2::new();
-    let mut struct_inst_fields = TokenStream2::new();
+    fn fields_config(input: &mut syn::ItemStruct) -> syn::Result<Vec<FieldConfig>> {
+        let mut configs = Vec::with_capacity(input.fields.len());
 
-    for field in struct_defn.fields {
-        let ident = field
-            .ident
-            .expect("Failed to find field identifier. Don't use this on a tuple struct.");
-
-        // Determine the default value, declared using the `#[default(...)]` syntax
-        let default = field
-            .attrs
-            .iter()
-            .find_map(|a| {
-                a.path()
-                    .is_ident("default")
-                    .then(|| a.parse_args::<Expr>().ok())
-            })
-            .flatten()
-            .expect(&format!(
-                "Failed to find `#[default(...)]` attribute for field `{}`.",
-                ident.to_string(),
-            ));
-
-        let ty = field.ty;
-
-        // Is this field overridden?
-        let val = match cfg.vals.get(&ident.to_string()) {
-            Some(t) => {
-                let t_string = t.to_string();
-                syn::parse_str::<Expr>(&t_string).expect(&format!(
-                    "Failed to parse `{}` as a valid token!",
-                    &t_string
-                ))
+        for field in input.fields.iter_mut() {
+            if field.ident.is_none() {
+                const MESSAGE: &'static str =
+                    "Failed to find field identifier. Don't use this on a tuple struct";
+                return Err(syn::Error::new(field.span(), MESSAGE));
             }
-            None => default,
+
+            let attrs = {
+                let attrs = core::mem::take(&mut field.attrs);
+                let (our, other) = attrs.into_iter().partition(|attr| {
+                    let path = attr.path();
+                    path.is_ident("toml_cfg") || path.is_ident("default") // default added for backwards compatibility
+                });
+                field.attrs = other;
+                our
+            };
+
+            let tokens = attrs.into_iter().try_fold(TokenStream2::default(), |mut ts, attr| {
+                let mut content = attr.parse_args::<TokenStream2>()?;
+
+                if attr.path().is_ident("default") {
+                    let default = tokens::default::default();
+                    content = quote! { #default (#content) };
+
+                    let deprecated = tokens::deprecated::default();
+                    ts.extend(quote! { #deprecated (#default)});
+                }
+
+                ts.extend(content);
+
+                syn::Result::Ok(ts)
+            })?;
+            configs.push(syn::parse2::<FieldConfig>(tokens)?);
+        }
+
+        Ok(configs)
+    }
+
+    fn apply_config(input: &syn::ItemStruct, config: toml::Table) -> syn::Result<Parsed> {
+        let path = vec![Self::generate_inner_ident(&input.ident)];
+        let value = toml::Value::Table(config);
+        let mut parsed = Vec::new();
+
+        Self::apply_config_inner(path, &value, &mut parsed)?;
+        Ok(parsed)
+    }
+
+    fn apply_config_inner(
+        path: Vec<syn::Ident>,
+        value: &toml::Value,
+        configs: &mut Parsed,
+    ) -> syn::Result<()> {
+        if let Some(table) = value.as_table() {
+            for (field, value) in table {
+                let mut path = path.clone();
+                path.push(syn::parse_str::<syn::Ident>(field)?);
+                Self::apply_config_inner(path, value, configs)?;
+            }
+        } else {
+            let t_string = value.to_string();
+            let value = syn::parse_str::<Expr>(&t_string).map_err(|mut err| {
+                let message =
+                    format!("Failed to parse `{value}` as a valid token!", value = &t_string);
+                err.combine(syn::Error::new(err.span(), message));
+                err
+            })?;
+            configs.push((path, value));
+        }
+        Ok(())
+    }
+
+    fn load(span: Span, path: impl AsRef<Path>) -> Option<syn::Result<toml::Table>> {
+        // Load toml data
+        let mut crates = {
+            let contents = std::fs::read_to_string(path).ok()?;
+            toml::from_str::<Crates>(&contents).ok()?
         };
 
-        quote! {
-            pub #ident: #ty,
-        }
-        .to_tokens(&mut struct_defn_fields);
+        // Take config for current crate
+        let pkg_name = env::var("CARGO_PKG_NAME").ok()?;
+        let config = crates.remove(&pkg_name);
 
-        quote! {
-            #ident: #val,
+        // If the config is not found, but it is required
+        if config.is_none() && Self::is_require_present() {
+            let message = format!(
+                "{key}={value} set, but valid config not found!",
+                key = Self::ENV_KEY,
+                value = Self::ENV_VALUE
+            );
+            return Some(Err(syn::Error::new(span, message)));
         }
-        .to_tokens(&mut struct_inst_fields);
+
+        config.map(Ok)
     }
 
-    let struct_ident = struct_defn.ident;
-    let shouty_snek: TokenStream2 = struct_ident
-        .to_string()
-        .TO_SHOUTY_SNEK_CASE()
-        .parse()
-        .expect("NO NOT THE SHOUTY SNAKE");
+    fn is_require_present() -> bool {
+        env::var(Self::ENV_KEY).is_ok_and(|value| value.contains(Self::ENV_VALUE))
+    }
 
-    let hack_retrigger = match (got_cfg, cfg_path) {
-        (false, _) | (true, None) => quote! {},
-        (true, Some(cfg_path)) => {
-            let cfg_path = format!("{}", cfg_path.display());
-            quote! {
-                const _: &[u8] = include_bytes!(#cfg_path);
+    fn get_path() -> Option<PathBuf> {
+        let mut path = find_root_path()?;
+        path.push(Self::FILE_NAME);
+        Some(path)
+    }
+
+    fn generate_inner_ident(ident: &syn::Ident) -> syn::Ident {
+        syn::Ident::new(&ident.to_string().to_snek_case(), ident.span())
+    }
+
+    fn generate_default(&self, warnings: &mut Vec<Warning>) -> TokenStream2 {
+        let fields = self.input.fields.iter().zip(self.fields_config.iter());
+        let fields = fields.fold(vec![], |mut out, (field, config)| {
+            let (value, is_deprecated) = &config.default;
+
+            if let Some(warning) = is_deprecated.then(|| {
+                let title = field.ident.as_ref().unwrap();
+                let value = value.to_token_stream().to_string();
+                Warning::new_deprecated(format!("{title}_default"))
+                    .old(format!("#[default({value})]"))
+                    .new(format!("#[toml_cfg(default({value}))]"))
+                    .span(field.span())
+                    .build_or_panic()
+            }) {
+                warnings.push(warning);
+            }
+
+            out.push({
+                let ident = field.ident.as_ref();
+                quote! { #ident: #value }
+            });
+
+            out
+        });
+
+        let ident = &self.input.ident;
+        quote! {
+            #ident {
+                #(#fields),*
             }
         }
-    };
-
-    quote! {
-        pub struct #struct_ident {
-            #struct_defn_fields
-        }
-
-        pub const #shouty_snek: #struct_ident = #struct_ident {
-            #struct_inst_fields
-        };
-
-        mod toml_cfg_hack {
-            #hack_retrigger
-        }
     }
-    .into()
 }
 
-fn load_crate_cfg(path: &Path) -> Option<Defn> {
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let parsed = toml::from_str::<Config>(&contents).ok()?;
-    let name = env::var("CARGO_PKG_NAME").ok()?;
-    parsed.crates.get(&name).cloned()
+impl ToTokens for Config {
+    fn to_tokens(&self, tokens: &mut TokenStream2) {
+        let ident = &self.input.ident;
+        let mut warnings = Vec::new();
+
+        if self.is_attribute {
+            let warning = Warning::new_deprecated("_attribute_toml_config")
+                .old("#[toml_cfg::toml_config]")
+                .new("#[derive(toml_cfg::TomlConfig)]")
+                .build_or_panic();
+            warnings.push(warning);
+
+            let input = &self.input;
+            tokens.extend(quote::quote_spanned! { input.span() => #input  })
+        }
+
+        let inner = Self::generate_inner_ident(ident);
+        let outer = syn::Ident::new(&ident.to_string().TO_SHOUTY_SNEK_CASE(), ident.span());
+        let default = self.generate_default(&mut warnings);
+
+        let config = self.config.iter().map(|(field, value)| {
+            quote! { #(#field).* = #value }
+        });
+
+        tokens.extend(quote! {
+            pub const #outer: #ident = {
+                let mut #inner = #default;
+                {
+                    #(#config);*
+                }
+                #inner
+            };
+        });
+
+        let retrigger = &self.retrigger;
+        let private = syn::Ident::new(
+            &format!("_toml_cfg_{}", ident.to_string().to_snek_case()),
+            ident.span(),
+        );
+        tokens.extend(quote! {
+            mod #private {
+                #retrigger
+
+                #(#warnings)*
+            }
+        })
+    }
 }
 
-// From https://stackoverflow.com/q/60264534
+mod tokens {
+    syn::custom_keyword!(deprecated);
+    syn::custom_keyword!(default);
+}
+
 fn find_root_path() -> Option<PathBuf> {
     // First we get the arguments for the rustc invocation
-    let mut args = std::env::args();
+    let mut args = std::env::args().peekable();
 
     // Then we loop through them all, and find the value of "out-dir"
     let mut out_dir = None;
     while let Some(arg) = args.next() {
-        if arg == "--out-dir" {
+        if arg == "--extern" && args.peek().is_some_and(|arg| arg.starts_with("toml_cfg")) {
             out_dir = args.next();
+            break;
         }
     }
 
     // Finally we clean out_dir by removing all trailing directories, until it ends with target
-    let mut out_dir = PathBuf::from(out_dir?);
+    let mut out_dir = PathBuf::from(out_dir?.trim_start_matches("toml_cfg="));
     while !out_dir.ends_with("target") {
         if !out_dir.pop() {
             // We ran out of directories...
@@ -252,4 +417,52 @@ fn find_root_path() -> Option<PathBuf> {
     out_dir.pop();
 
     Some(out_dir)
+}
+
+#[proc_macro_attribute]
+pub fn toml_config(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let out = match Config::new(item, true) {
+        Ok(config) => config.into_token_stream(),
+        Err(err) => err.into_compile_error(),
+    };
+    out.into()
+}
+
+#[proc_macro_derive(TomlConfig, attributes(toml_cfg))]
+pub fn toml_config_derive(item: TokenStream) -> TokenStream {
+    let out = match Config::new(item, false) {
+        Ok(config) => config.into_token_stream(),
+        Err(err) => err.into_compile_error(),
+    };
+    out.into()
+}
+
+fn parse_paren<T: parse::Peek, R: parse::Parse>(
+    ret: &mut Option<R>,
+    lookaheed: &parse::Lookahead1,
+    input: &parse::ParseBuffer,
+    token: T,
+) -> syn::Result<bool>
+where
+    T::Token: parse::Parse + Spanned,
+{
+    if lookaheed.peek(token) {
+        let token = input.parse::<T::Token>()?;
+
+        let content;
+        syn::parenthesized!(content in input);
+
+        if ret.is_some() {
+            let message = format!("Duplicate {} attribute", T::Token::display());
+            return Err(syn::Error::new(token.span(), message));
+        }
+        *ret = Some(content.parse()?);
+
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }

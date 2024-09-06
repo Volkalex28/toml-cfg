@@ -17,6 +17,7 @@ proc-macro2 = "1.0.34"
 quote = "1.0.10"
 toml = "0.8.10"
 heck = "0.4.0"
+proc-macro-warning = "1.0.2"
 
 [dependencies.serde]
 version = "1.0.133"
