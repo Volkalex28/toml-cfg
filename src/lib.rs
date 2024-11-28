@@ -88,7 +88,7 @@
 //! ```
 //!
 
-use heck::{ToShoutySnekCase, ToSnekCase};
+use heck::{ToShoutySnakeCase, ToSnakeCase};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use proc_macro_warning::Warning;
@@ -301,7 +301,7 @@ impl Config {
     }
 
     fn generate_inner_ident(ident: &syn::Ident) -> syn::Ident {
-        syn::Ident::new(&ident.to_string().to_snek_case(), ident.span())
+        syn::Ident::new(&ident.to_string().to_snake_case(), ident.span())
     }
 
     fn generate_default(&self, warnings: &mut Vec<Warning>) -> TokenStream2 {
@@ -355,11 +355,13 @@ impl ToTokens for Config {
         }
 
         let inner = Self::generate_inner_ident(ident);
-        let outer = syn::Ident::new(&ident.to_string().TO_SHOUTY_SNEK_CASE(), ident.span());
+        let outer = syn::Ident::new(&ident.to_string().to_shouty_snake_case(), ident.span());
         let default = self.generate_default(&mut warnings);
 
-        let config = self.config.iter().map(|(field, value)| {
-            quote! { #(#field).* = #value }
+        let config = self.config.iter().filter_map(|(field, value)| {
+            let config = field.get(1)?;
+            (self.input.fields.iter().any(|f| f.ident.as_ref().is_some_and(|i| i == config)))
+                .then(|| quote! { #(#field).* = #value })
         });
 
         tokens.extend(quote! {
@@ -374,7 +376,7 @@ impl ToTokens for Config {
 
         let retrigger = &self.retrigger;
         let private = syn::Ident::new(
-            &format!("_toml_cfg_{}", ident.to_string().to_snek_case()),
+            &format!("_toml_cfg_{}", ident.to_string().to_snake_case()),
             ident.span(),
         );
         tokens.extend(quote! {
